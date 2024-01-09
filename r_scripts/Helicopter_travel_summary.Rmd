@@ -1,0 +1,369 @@
+---
+title: "Helicopter Travel Time Summary"
+author: "Michael May, Mitchell Stephen"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### **Introduction**
+
+This document demonstrates the modified application of the helicopter travel time analysis process developed by Michael Storey and Michael Jones for Port Phillip to the Gippsland context. The logic is the same, but the process has been updated to enable the use of larger datasets and resolve some issues.
+
+This is a demonstration only. It has known limitations and faults:
+
+-   Incomplete locations of helidam water points on public land - these are not available in any complete/consolidated form.
+-   Uncertainty about the suitability of private dams and other water bodies for helicopter water points.
+-   Models of helicopter flight are rudimentary and unrealistic.
+
+We are currently seeking better water point data, and have drafted a more realistic method for estimating helicopter flight.
+
+```{r Chunk 1: Load data, message=FALSE, warning=FALSE, out.width='100%'}
+# load necessary libraries
+  library(sf)
+  library(dplyr)
+  library(leaflet)
+  library(leaflet.extras)
+  library(htmltools)
+  library(spatstat)
+  library(leafem)
+  library(raster)
+  library(ggplot2)
+  library(formattable)
+
+# path locations
+  output_path   <- "C:/Projects/20230829_HeliWaterPoints/waterpoints/outputs"
+  input_path    <- "C:/Projects/20230829_HeliWaterPoints/waterpoints/data/"
+
+# file names
+  raster_simple <- "travel_time_simple.tif"
+  raster_slope  <- "travel_time_slope.tif"
+  wp_combined   <- "Waterpoints_Combined_20230912.shp"
+  districts     <- "LF_DISTRICT.shp"
+  workcentres   <- "workcentre_footprints_vicgrid94.shp"
+  point_grid    <- "point_grid_wc.shp"
+  gipps_frame   <- "Bass_NSW_VIC_GippsExcised.shp"
+
+# construct full file paths
+  raster_simple_full_path <- file.path(output_path, raster_simple)
+  raster_slope_full_path  <- file.path(output_path, raster_slope)
+  wp_combined_full_path   <- file.path(input_path, wp_combined)
+  districts_full_path     <- file.path(input_path, districts)
+  workcentres_full_path   <- file.path(input_path, workcentres)
+  point_grid_full_path    <- file.path(output_path, point_grid)
+  gipps_frame_full_path   <- file.path(input_path, gipps_frame)
+
+# import previously processed data
+  raster_simple           <- raster::raster(raster_simple_full_path)
+  raster_slope            <- raster::raster(raster_slope_full_path)
+  waterpoints             <- st_read(wp_combined_full_path, quiet=TRUE) %>% st_transform(4326, quiet=TRUE)
+  districts_outline       <- st_read(districts_full_path, quiet = TRUE) %>%
+    st_transform(4326, quiet = TRUE) %>%
+    filter(DISTRICT_N == "TAMBO" | DISTRICT_N == "MACALISTER" | DISTRICT_N =="SNOWY" | DISTRICT_N == "LATROBE")
+  workcentres_poly        <- st_read(workcentres_full_path, quiet=TRUE) %>% st_transform(4326, quiet=TRUE)
+  gipps_frame_poly         <- st_read(gipps_frame_full_path, quiet=TRUE) %>% st_transform(4326, quiet=TRUE)
+  point_data              <- st_read(point_grid_full_path, quiet=TRUE) %>% st_transform(4326, quiet=TRUE)
+
+  
+  simple_range = range(values(raster_simple))
+  slope_range = range(values(raster_slope))
+
+
+# ### Helicopter travel time map (simple)
+# 
+# -   Interactive map of time to closest reservoir (in minutes). Hover mouse over to see return times.
+# -   This map assumes helicopters ascend and descend vertically, and fly horizontally in-between
+# 
+# ```{r Chunk 2: Map 1 (simple), message=FALSE, warning=FALSE, out.width='100%'}
+# 
+# # Create a custom color palette from green (0) to red (30)
+#   custom_palette <- colorRampPalette(c("green", "yellow", "orange", "red"))(10)
+#   custom_palette <- colorBin(custom_palette, c(0, 30), 10, pretty = FALSE)
+# 
+# # Create a Leaflet map
+#   map_raster_simple <- leaflet() %>%
+#     addProviderTiles("OpenStreetMap") %>%
+#     setView(147.20, -37.72,zoom = 8) %>%
+#     addPolygons(
+#       data = as(districts_outline, "Spatial"),
+#       smoothFactor = 0.2,
+#       color = 'purple',
+#       weight =0.8,
+#       opacity = 0.5,
+#       fillOpacity = 0
+#     ) %>%
+#     addRasterImage(
+#       raster_simple,
+#       project = TRUE,
+#       group = "Minutes",
+#       layerId = "Minutes",
+#     colors = custom_palette,
+#     opacity = 0.5
+#     ) %>%
+#     addPolygons(
+#       data = as(waterpoints, "Spatial"),
+#     stroke = FALSE,
+#     smoothFactor = 0.2,
+#     fillColor = 'blue',
+#     fillOpacity = 0.8
+#     ) %>%
+#     addImageQuery(
+#       raster_simple,
+#       project = TRUE,
+#       layerId = "Minutes",
+#       digits = 1,
+#       prefix = "Helicopter return"
+#     ) %>%
+#     addLegend(
+#       "bottomright",
+#       values = simple_range,
+#       pal = custom_palette,
+#       title = "Time in minutes",
+#       opacity = 0.5
+#     )
+#   
+#   # draw map
+#   map_raster_simple
+
+#```
+```
+
+------------------------------------------------------------------------
+
+##  Helicopter travel time map
+
+-   Interactive map of helicopter return time to closest reservoir. Hover mouse over to see return times (minutes).
+-   This map assumes helicopters fly on angles over peaks at a constant speed of 74 km/h while ascending and loaded with water and at 148 km/hr otherwise (level, descending or empty).
+
+```{r Chunk 2: Map (advanced), message=FALSE, warning=FALSE, out.width='100%'}
+
+# Create a custom color palette from green (0) to red (30)
+  custom_palette <- colorRampPalette(c("darkcyan", "green", "yellow", "orange", "red", "darkred"))(10)
+  custom_palette <- colorBin(custom_palette, c(0, 30), 10, pretty = FALSE)
+  
+
+
+# Create a Leaflet map
+  map_raster_slope <- leaflet() %>%
+    addProviderTiles("OpenTopoMap") %>%
+    setView(147.20, -37.72, zoom = 8) %>%
+    addRasterImage(
+      raster_slope,
+      project = TRUE,
+      group = "Time",
+      layerId = "Time",
+      colors = custom_palette,
+      opacity = 0.5
+    ) %>%
+    addPolygons(
+      data = as(districts_outline, "Spatial"),
+      smoothFactor = 0.8,
+      color = 'white',
+      weight = 1.5,
+      opacity = 0.8,
+      fillOpacity = 0
+    ) %>%
+    addPolygons(
+      data = as(gipps_frame_poly, "Spatial"),
+      stroke = FALSE,
+      smoothFactor = 0.8,
+      fillColor = 'white',
+      fillOpacity = 0.75,
+      opacity = 0.75,
+    ) %>%
+    addPolygons(
+      data = as(waterpoints, "Spatial"),
+      stroke = FALSE,
+      smoothFactor = 0.2,
+      fillColor = 'blue',
+      fillOpacity = 0.8
+    ) %>%
+    addImageQuery(
+      raster_slope,
+      project = TRUE,
+      layerId = "Time",
+      digits = 1,
+      prefix = "Helicopter return"
+    ) %>%
+    addLegend(
+      "bottomright",
+      values = slope_range,
+      pal = custom_palette,
+      title = "Time in minutes",
+      opacity = 0.5
+    )
+  
+  # Draw map
+    map_raster_slope
+
+```
+
+------------------------------------------------------------------------
+
+## Summary statistics
+
+#### **Helicopter return time (minutes) for Gippsland region**
+
+```{r Chunk 3: Summary - Region, message=FALSE, warning=FALSE, out.width='100%'}
+
+# Calculate the average values within the regional footprint
+  summary_region <- st_drop_geometry(point_data) %>%
+    filter(!is.na(REGION_)) %>%
+    group_by('Region' = REGION_) %>%
+    summarize('Average return time' = round(mean(ttl_tm_s), digits = 2)) %>%
+    ungroup()
+
+# Create table for region
+  formattable(summary_region, align = c("l", "r"))
+
+```
+
+------------------------------------------------------------------------
+
+#### **Helicopter return time (minutes) for Gippsland districts**
+
+```{r Chunk 4: Summary - District, message=FALSE, warning=FALSE, out.width='100%'}
+
+# Calculate the average values within each district footprint
+  summary_district <- st_drop_geometry(point_data) %>%
+    filter(!is.na(District)) %>%
+    group_by(District) %>%
+    summarize('Average return time' = round(mean(ttl_tm_s), digits = 2)) %>%
+    ungroup()
+
+# Create box plots for districts
+  plot_district <- ggplot(data = point_data %>% filter(!is.na(District)), 
+                          aes(x = District, y = ttl_tm_s)) +
+    geom_boxplot(outlier.size = 0.6, 
+                 outlier.colour = 'lightblue', 
+                 fill = "white", 
+                 color = "black", 
+                 notch =FALSE) +
+    stat_boxplot(geom ='errorbar') +
+    labs(
+      x = "", #"District",
+      y = "Return Time") +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) #+ 
+    #ggtitle("Box Plot of Helicopter Return Time by District")
+  
+# Force plot axis to extend to zero
+  plot_district <- plot_district + expand_limits(x = 0, y = 0)
+
+# Draw plot
+  plot_district
+    
+# Create table for districts
+  formattable(summary_district, list(
+    'Average return time' = color_bar("lightblue", fun='proportion')),
+    align = c("l", "r"))
+
+```
+
+------------------------------------------------------------------------
+
+#### **Helicopter return time (minutes) for Gippsland workcentres**
+
+```{r Chunk 5: Summary - Workcentre, message=FALSE, warning=FALSE, out.width='100%'}
+
+# Calculate the average values within each workcentre footprint
+  summary_workcentre <- st_drop_geometry(point_data) %>%
+    filter(!is.na(Work_Centr)) %>%
+    group_by('Workcentre' = Work_Centr) %>%
+    summarize('Average return time' = round(mean(ttl_tm_s), digits = 2)) %>%
+    ungroup()
+
+# Create box plots for workcentres
+  plot_workcentre <- ggplot(data = point_data %>% filter(!is.na(Work_Centr)),
+                            aes(x = Work_Centr, y = ttl_tm_s)) +
+    geom_boxplot(outlier.size = 0.6, 
+                 outlier.colour = 'lightblue', 
+                 fill = "white", 
+                 color = "black", 
+                 notch =TRUE) +
+    stat_boxplot(geom ='errorbar') +
+    labs(
+      x = "", #"Workcentre",
+      y = "Return Time"
+    ) +
+    theme(axis.text.x=element_text(angle = -40, hjust = 0))
+
+# Force plot axis to extend to zero
+  plot_workcentre <- plot_workcentre + expand_limits(x = 0, y = 0)
+
+# Draw plot
+  plot_workcentre
+
+# Create table for workcentres
+  formattable(summary_workcentre, list(
+    'Average return time' = color_bar("lightblue", fun='proportion')),
+    align = c("l", "r")
+    )
+
+library(purrr)
+
+# Function to create scatter plots and calculate regression statistics
+create_scatter_plot <- function(data, district) {
+  lm_result <- lm(ttl_tm_s ~ dst_ttl, data = data)
+  summary_df <- data.frame(
+    Intercept = coef(lm_result)[1],
+    Slope = coef(lm_result)[2],
+    R_Squared = summary(lm_result)$r.squared
+  )
+
+  plot <- ggplot(data, aes(x = dst_ttl, y = ttl_tm_s)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE, color = "blue") +
+    labs(
+      title = paste("Scatter Plot and Linear Regression for District", district),
+      x = "dst_ttl",
+      y = "ttl_tm_s"
+    ) +
+    theme_minimal() +
+    geom_text(
+      x = max(data$dst_ttl) * 0.8,
+      y = max(data$ttl_tm_s) * 0.8,
+      label = paste("R^2 =", round(summary(lm_result)$r.squared, 2)),
+      hjust = 0
+    ) +
+    expand_limits(x = max(data$dst_ttl) * 1.1, y = max(data$ttl_tm_s) * 1.1)
+  
+  return(list(plot = plot, summary = summary_df))
+}
+
+# Group the data by Work_Centr (district) and create scatter plots
+scatter_plots <- point_data %>%
+  group_split(Work_Centr) %>%
+  map2(.x = ., .y = unique(point_data$Work_Centr), .f = create_scatter_plot)
+
+# Create a scatter plot and calculate regression statistics for all data combined
+combined_lm_result <- lm(ttl_tm_s ~ dst_ttl, data = point_data)
+combined_summary_df <- data.frame(
+  Intercept = coef(combined_lm_result)[1],
+  Slope = coef(combined_lm_result)[2],
+  R_Squared = summary(combined_lm_result)$r.squared
+)
+
+# Plot for all data combined
+combined_plot <- ggplot(point_data, aes(x = dst_ttl, y = ttl_tm_s)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "Scatter Plot and Linear Regression for All Data Combined",
+    x = "dst_ttl",
+    y = "ttl_tm_s"
+  ) +
+  theme_minimal() +
+  geom_text(
+    x = max(point_data$dst_ttl) * 0.8,
+    y = max(point_data$ttl_tm_s) * 0.8,
+    label = paste("R^2 =", round(summary(combined_lm_result)$r.squared, 2)),
+    hjust = 0
+  ) +
+  expand_limits(x = max(point_data$dst_ttl) * 1.1, y = max(point_data$ttl_tm_s) * 1.1)
+  
+```

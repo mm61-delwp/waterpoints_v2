@@ -1,0 +1,516 @@
+---
+title: "Heli-attack times"
+author: "Michael Storey, MichaelJones, Mitchell Stephen, Michael May"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```         
+To Do:
+  [x] Demonstration-quality waterpoints layer
+  [ ] High-quality waterpoints/reservoir/lakes layer
+  [ ] Classify water points (long line, medium heavy etc.)
+  [ ] Improve helicopter travel model
+  [x] Exclude demand points in the ocean/NSW
+  [x] Improve leaflet map usability by converting point data to raster
+  [ ] Erase raster values outside Gippsland footprint
+  [x] Allow user to query map data
+  [ ] Produce summary statistics for region, districts and workcentres
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#set local library path so R knows where to look. You will also need to run this line below before downloading new packages, just due to some cenitex issues.
+#.libPaths("D:/R/R-Packages")
+
+# load necessary libraries
+  library(sf)
+  library(dplyr)
+  library(leaflet)
+  library(leaflet.extras)
+  library(htmltools)
+  library(spatstat)
+  library(leafem)
+  library(raster)
+
+```
+
+### Setup
+
+-   Define all inputs and variables
+
+Remainder of script should run without requiring modification
+
+```{r Chunk 1: Setup}
+knitr::opts_chunk$set(cache = TRUE)
+
+# path locations
+  output_path <- "C:/Projects/20230829_HeliWaterPoints/waterpoints/outputs"
+  input_path <- "C:/Projects/20230829_HeliWaterPoints/waterpoints/data/"
+
+# shapefile names
+  dem_file        <- "DEM_SE_Tas_mosaic.tif"
+  wp_combined     <- "Waterpoints_Combined_20230912.shp"
+  wp_new          <- "potential_dam_locations_14052020.shp"
+  demand_points   <- "demandpoints_1kmIgnitionGrid.shp"
+  districts       <- "LF_DISTRICT.shp"
+
+# construct full file paths
+  dem <- file.path(input_path, dem_file)
+  #wp_private_land_full_path <- file.path(input_path, wp_private_land)
+  #wp_public_land_full_path <- file.path(input_path, wp_public_land)
+  wp_combined_full_path <- file.path(input_path, wp_combined)
+  wp_new_full_path <- file.path(input_path, wp_new)
+  demand_points_full_path <- file.path(input_path, demand_points)
+  districts_full_path <-file.path(input_path, districts)
+
+# helicopter speeds in kilometers per hour
+  all_empty_kmh <- 148
+  full_ascend_kmh <- 74
+  full_level_kmh <- 148 #same as full descending
+
+# path sample density (metres between samples from reservoirs to points)
+  line_sample_point_dist <- 200
+
+# choose whether to include new dams (1) or not (0). Don't use 1 under a 1k grid, will take too long.
+  include_new_wp <- 0
+
+# filter for one or more districts
+  selected_districts <- ('DISTRICT_N == \"TAMBO\" | DISTRICT_N == \"MACALISTER\" | DISTRICT_N ==\"SNOWY\" | DISTRICT_N == \"LATROBE\"')
+
+```
+
+### Create demand grid
+
+-   Load shapefiles
+-   Transform coordinate reference system (CRS),and define the variable.
+-   Create a point grid across region (ie encompassing the reservoirs of interest).
+-   Plot grid points black and water in blue
+
+```{r Chunk 2: Create demand grid, echo=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+
+# load and project district shapefile
+  district_poly <- st_read(districts_full_path, quiet = TRUE) %>%
+    st_transform(3111, quiet = TRUE) %>%
+    filter(DISTRICT_N == "TAMBO" | DISTRICT_N == "MACALISTER" | DISTRICT_N =="SNOWY" | DISTRICT_N == "LATROBE")
+
+# load and project water points shapefile
+  wp_combined_poly <- st_read(wp_combined_full_path, quiet=TRUE) %>% st_transform(3111, quiet=TRUE)
+  
+# load and project candidate sites for new helidams
+  new_dams<-st_read(wp_new_full_path, quiet=TRUE) %>% st_transform(3111, quiet=TRUE) 
+  #st_crs(new_dams)<-3111
+  #point_grid<- water_poly %>% st_make_grid(point_grid_size,what='centers') %>% st_as_sf()
+
+# Read and transform the demand points to a common CRS (e.g., 3111)
+  demand_points <- st_read(demand_points_full_path, quiet = TRUE) %>% st_transform(3111, quiet=TRUE) 
+
+# Use st_intersection to find points within polygons
+  point_grid <- st_intersection(demand_points, district_poly)
+  
+  water_points<-st_cast(wp_combined_poly,"POINT")
+
+# add new dams to water points if include_new_dams variable set to 1
+  if(include_new_wp == 1){water_points<-st_union(water_points, new_dams) %>% st_cast("POINT")}
+
+```
+
+### Create traversal lines
+
+-   Draw a line from every point in grid to its closest water source.
+
+```{r Chunk 3: Create traversal lines, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+
+# create lines from every grid point to nearest water point
+water_points$wp_id <- seq.int(nrow(water_points))
+water_points$geom_start <- water_points$geometry
+point_grid$dp_id <- seq.int(nrow(point_grid))
+point_grid <- st_join(point_grid, water_points, join=st_nearest_feature)
+near_lines <- nngeo::st_connect(point_grid$geometry, point_grid$geom_start, k=1, progress = FALSE)
+point_grid$line <- st_as_sf(near_lines) 
+
+
+```
+
+### Embed DEM into traversal lines
+
+-   For every line from point grid to water, densify line (make vertex every 100 metres) and turn vertices into points (transferring line id to new point feature class)
+-   Sample the DEM for every line vertex point, and select the point with the maximum elevation.
+-   Sample the DEM for elevation of start point (where fire would be) and end point (water point)
+-   Calculate the difference in elevation between start, end, and max elevation
+
+```{r Chunk 4: Embed DEM, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+
+# densify lines (make vertices every <line_sample_point_dist> metres)
+  lines_dense <- point_grid$line %>% smoothr::densify(max_distance=line_sample_point_dist)
+  lines_dense$dp_id <- point_grid$dp_id
+  lines_vertices <- st_cast(lines_dense, "POINT", do_split = TRUE, warn = FALSE)
+
+# sample dem for peak elevation
+  raster_dem<-raster::raster(dem)
+  
+  lines_vertices$dem_path <- raster::extract(raster_dem, st_transform(lines_vertices, 4326, quiet=FALSE))
+  max_dem_vertex <- lines_vertices %>%
+    group_by(dp_id) %>%
+    arrange(desc(dem_path)) %>%   # Arrange by dem_path in descending order
+    slice(1) %>%                  # Take the first row within each group
+    ungroup()
+  point_grid$elev_peak <- max_dem_vertex$dem_path
+  point_grid$geom_peak <- near_lines$start_geom <- st_transform(max_dem_vertex$x, 3111)
+
+# sample dem for start and end points
+  point_start <- st_as_sf(point_grid$geom_start)
+  point_end <- st_as_sf(point_grid$geometry)
+  point_peak <- st_as_sf(point_grid$geom_peak)
+  
+  point_grid$elev_start <- raster::extract(raster_dem,st_transform(point_start, 4326))
+  point_grid$elev_end <- raster::extract(raster_dem,st_transform(point_end, 4326))
+
+# calculate height differences
+  point_grid$start_peak_diff <- as.double(point_grid$elev_peak) - as.double(point_grid$elev_start)
+  point_grid$end_peak_diff <- as.double(point_grid$elev_peak) - as.double(point_grid$elev_end)
+
+
+```
+
+### Draw test plots
+
+-   Plot 1 illustrates the demand grid and water point locations. Grid points are black circles and water is blue
+-   Plot 2 adds traversal lines from demand grid points to nearest water point (brown lines)
+-   Plot 3 includes the highest point vertex in red
+
+```{r Chunk 5: Draw test plots, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+
+# draw test plot of water point locations
+  plot(st_geometry(point_grid), cex=0.1)
+  plot(st_geometry(point_grid$geom_start), cex=0.1, col='blue', add=TRUE)
+
+# draw test plot with lines between demand points and nearest water point
+  plot(st_geometry(point_grid))
+  plot(st_geometry(point_grid$geom_start), cex=0.1,col='blue', add=TRUE)
+  plot(st_geometry(point_grid$line), cex=0.5, col="yellow", add=TRUE)
+
+# draw test plot including max DEM point in purple
+  plot(st_geometry(wp_combined_poly))
+  plot(st_geometry(point_grid), cex=0.6, col='red', add=TRUE)
+  plot(st_geometry(point_grid$geom_start), cex=0.2, col='blue', add=TRUE)
+  plot(st_geometry(point_grid$line), cex=0.2, col="green", add=TRUE)
+  plot(st_geometry(point_grid$geom_peak), cex=0.4, col = 'purple', add=TRUE)
+
+```
+
+### Calculate helicopter travel times
+
+-   Calculate distance (2D) between:
+    -   water point and demand point
+    -   water point and highest elevation point
+    -   highest elevation point and demand point
+-   Adjust distances to account for changes in elevation
+-   Calculate travel times assuming:
+    -   74 km/h speed when ascending full
+    -   148 km/h for other states (empty, level flight, descending)
+    -   2 minutes for fill time
+-   Summarise travel times using two different methods:
+    -   Helicopter ascends vertically, flies level, then descends vertically
+    -   Helicopter ascends at an angle between the water point and highest point; descends at an angle between the highest point and demand point
+-   Create rasters using IDW (distance-weighted smoothing) for efficient maps
+
+```{r Chunk 6: Helicopter travel times, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+
+### NOTE:
+### I've turned this into an inefficient for-loop because I had to work around a very large (73+GB) vector produced
+### by the original code. And while creating the work-around, I came across the zero-value errors, which required debugging.
+###
+### This whole section could be improved and sped up by shifting to vector logic.
+### But I want to retain it for now so we can implement a semi-realistic helicopter model (this one is garbage).
+
+# Initialize vectors to store the calculated distances and inclines
+  distance_t <- numeric(length(nrow(point_grid)))
+  distance_s <- numeric(length(nrow(point_grid)))
+  distance_e <- numeric(length(nrow(point_grid)))
+  distance_s_3d <- numeric(length(nrow(point_grid)))
+  distance_e_3d <- numeric(length(nrow(point_grid)))
+  incline_s <- numeric(length(nrow(point_grid)))
+  incline_e <- numeric(length(nrow(point_grid)))
+
+# Loop through each row and calculate distances and inclines
+  numrows <- nrow(point_grid)
+  pb <- progress_estimated(numrows)
+  cat("Analysing", numrows, "transects\n")
+  for (i in 1:numrows) {
+    pb$tick()$print()
+    # Calculate distances
+    distance_t[i] <- as.numeric(st_distance(point_start[i, ], point_end[i, ]))
+    distance_s[i] <- as.numeric(st_distance(point_start[i, ], point_peak[i, ]))
+    distance_e[i] <- as.numeric(st_distance(point_peak[i, ], point_end[i, ]))
+    
+    # Debugging
+    #cat("point:", i, "of", numrows, "\n")
+    # cat("distance_t:", distance_t[i], "\n")
+    # cat("distance_s:", distance_s[i], "\n")
+    # cat("distance_e:", distance_e[i], "\n")
+    # cat("start_peak_diff:", point_grid$start_peak_diff[i], "\n")
+    # cat("end_peak_diff:", point_grid$end_peak_diff[i], "\n")
+    
+    # Check for zero distances and handle them by assigning zero to distance_s_3d and incline_s
+    if (distance_s[i] == 0) {
+      distance_s_3d[i] <- 0
+      incline_s[i] <- 0
+    } else if (point_grid$start_peak_diff[i] == 0) {
+      distance_s_3d[i] <- distance_s[i]
+      incline_s[i] <- 0
+    } else {
+      # Calculate 3D distances
+      distance_s_3d[i] <- sqrt(distance_s[i]^2 + point_grid$start_peak_diff[i]^2)
+      incline_s[i] <- distance_s[i] / point_grid$start_peak_diff[i]
+    }
+    
+    # Check for zero distances and handle them by assigning zero to distance_e_3d and incline_e
+    if (distance_e[i] == 0) {
+      distance_e_3d[i] <- 0
+      incline_e[i] <- 0
+    } else if (point_grid$end_peak_diff[i] == 0) {
+      distance_e_3d[i] <- distance_e[i]
+      incline_e[i] <- 0
+    } else {
+      # Calculate 3D distances
+      distance_e_3d[i] <- sqrt(distance_e[i]^2 + point_grid$end_peak_diff[i]^2)
+      incline_e[i] <- (distance_e[i] / point_grid$end_peak_diff[i]) * -1
+    }
+  }
+
+# Add the distances to the dataframe
+  point_grid$dist_total     <- distance_t
+  point_grid$dist_start     <- distance_s
+  point_grid$dist_end       <- distance_e
+  point_grid$dist_start_3d  <- distance_s_3d
+  point_grid$dist_end_3d    <- distance_e_3d
+  point_grid$incline_start  <- incline_s
+  point_grid$incline_end    <- incline_e
+  
+  
+### UNTESTED VECTOR VERSION OF ABOVE:
+## Calculate distances for each row
+#point_grid$dist_total <- st_distance(point_start, point_end)
+#point_grid$dist_start <- st_distance(point_start, point_peak)
+#point_grid$dist_end <- st_distance(point_peak, point_end)
+#
+## Calculate 3D distances for each row, handling zero distances
+#point_grid$dist_start_3d <- ifelse(point_grid$dist_start == 0, 0,
+#                                   sqrt(point_grid$dist_start^2 + point_grid$start_peak_diff^2))
+#point_grid$dist_end_3d <- ifelse(point_grid$dist_end == 0, 0,
+#                                 sqrt(point_grid$dist_end^2 + point_grid$end_peak_diff^2))
+#
+## Calculate inclines for each row, handling zero distances
+#point_grid$incline_start <- ifelse(point_grid$dist_start == 0, 0,
+#                                    point_grid$dist_start / point_grid$start_peak_diff)
+#point_grid$incline_end <- ifelse(point_grid$dist_end == 0, 0,
+#                                  point_grid$dist_end / point_grid$end_peak_diff * -1)
+
+
+# Calculate times for different helicopter movements on flat distances
+  time_full_ascend_flat = (point_grid$start_peak_diff / 1000) / full_ascend_kmh
+  time_full_level_flat = (point_grid$dist_total / 1000) / full_level_kmh
+  time_full_descend_flat = (point_grid$end_peak_diff / 1000) / full_level_kmh
+  time_empty_ascend_flat = (point_grid$end_peak_diff / 1000) / all_empty_kmh
+  time_empty_level_flat = (point_grid$dist_total / 1000) / all_empty_kmh
+  time_empty_descend_flat = (point_grid$start_peak_diff / 1000) / all_empty_kmh
+  total_time_flat = round(
+    (time_full_ascend_flat + time_full_level_flat + time_full_descend_flat +
+     time_empty_ascend_flat + time_empty_level_flat + time_empty_descend_flat) * 60, 1
+  ) + 2  # Adding 2 minutes for fill time
+
+# Calculate times for different helicopter movements assuming flying on angles
+  time_full_ascend_slope   = (point_grid$dist_start_3d / 1000) / full_ascend_kmh
+  time_full_descend_slope  = (point_grid$dist_end_3d / 1000) / full_level_kmh
+  time_empty_ascend_slope  = (point_grid$dist_end_3d / 1000) / all_empty_kmh
+  time_empty_descend_slope = (point_grid$dist_start_3d / 1000) / all_empty_kmh
+  total_time_slope = round(
+    (time_full_ascend_slope + time_full_descend_slope +
+     time_empty_ascend_slope + time_empty_descend_slope) * 60, 1
+  ) + 2  # Adding 2 minutes for fill time
+
+# Update 'total_time' and 'total_time_slope' columns in 'point_grid'
+  point_grid$total_time_flat <- total_time_flat
+  point_grid$total_time_slope <- total_time_slope
+  
+# Extract x, y coordinate values
+  point_coords <- st_coordinates(st_as_sf(point_grid))
+
+# Create ppp objects from the coordinates
+  min_x <- min(point_coords[, 1])
+  max_x <- max(point_coords[, 1])
+  min_y <- min(point_coords[, 2])
+  max_y <- max(point_coords[, 2])
+  resolution <- 200
+  window_spec <- owin(c(min_x, max_x), c(min_y, max_y))
+  point_pattern_simple <- ppp(
+    point_coords[, 1], 
+    point_coords[, 2], 
+    marks = point_grid$total_time_flat, 
+    window = window_spec
+    )
+  point_pattern_slope <- ppp(
+    point_coords[, 1], 
+    point_coords[, 2], 
+    marks = point_grid$total_time_slope, 
+    window = window_spec
+    )
+
+# Perform IDW interpolation and make rasters
+  idw_result <- idw(point_pattern_simple, power = 5, eps = resolution)
+  idw_raster_simple <- as(idw_result, "RasterLayer")
+  crs(idw_raster_simple) <- 3111
+  
+  idw_result <- idw(point_pattern_slope, power = 5, eps = resolution)
+  idw_raster_slope <- as(idw_result, "RasterLayer")
+  crs(idw_raster_slope) <- 3111
+
+# Save the data frame, rasters and shapefiles
+  saveRDS(point_grid, "point_grid_data.rds")
+  st_write(point_grid,
+           file.path(output_path, "point_grid.shp"), 
+           overwrite=TRUE,
+           append=FALSE)
+  #near_lines<-st_as_sf(near_lines)
+  #st_write(near_lines, 
+  #         file.path(output_path, "near_lines.shp"),  
+  #         overwrite=TRUE)
+  writeRaster(idw_raster_simple, 
+              file.path(output_path, "travel_time_simple.tif"), 
+              format="GTiff", 
+              overwrite=TRUE)
+  writeRaster(idw_raster_slope, 
+              file.path(output_path, "travel_time_slope.tif"), 
+              format="GTiff", 
+              overwrite=TRUE)
+
+
+
+
+```
+
+### Helicopter travel time map (simple)
+
+-   Interactive map of time to closest reservoir (in minutes). Click on a point to see the minutes
+-   This map assumes helicopters ascend and descend vertically, and fly horizontally in-between
+
+```{r Chunk 7: Map 1 (simple), message=FALSE, warning=FALSE, out.width='100%'}
+
+# Create a custom color palette from green (0) to red (30)
+custom_palette <- colorRampPalette(c("green", "yellow", "orange", "red"))(10)
+custom_palette <- colorBin(custom_palette, c(0, 30), 10, pretty = FALSE)
+
+# Create a Leaflet map
+map_raster_simple <- leaflet() %>%
+  setView(-37.72, 147.20, zoom = 6) %>%
+  addProviderTiles("OpenStreetMap") %>%
+  addRasterImage(
+    idw_raster_simple,
+    project = TRUE,
+    group = "Minutes",
+    layerId = "Minutes",
+    colors = custom_palette,
+    opacity = 0.5
+  ) %>%
+  addPolygons(
+    data = as(st_transform(wp_combined_poly, 4326), "Spatial"),
+    stroke = FALSE,
+    smoothFactor = 0.2,
+    fillColor = 'blue',
+    fillOpacity = 0.8
+  ) %>%
+  addImageQuery(
+    idw_raster_simple,
+    project = TRUE,
+    layerId = "Minutes",
+    digits = 1,
+    prefix = "Helicopter return"
+  ) %>%
+  addLegend(
+    "bottomright",
+    values = range(values(idw_raster_simple)),
+    pal = custom_palette,
+    title = "Time in minutes",
+    opacity = 0.5
+  )
+
+map_raster_simple
+
+
+```
+
+### Helicopter travel time map (alternative)
+
+-   This map assumes helicopters fly on angles over peaks
+
+```{r Chunk 8: Map 2 (advanced), message=FALSE, warning=FALSE, out.width='100%'}
+
+# Create a custom color palette from green (0) to red (30)
+custom_palette <- colorRampPalette(c("green", "yellow", "orange", "red"))(10)
+custom_palette <- colorBin(custom_palette, c(0, 30), 10, pretty = FALSE)
+
+# Create a Leaflet map
+map_raster_slope <- leaflet() %>%
+  setView(-37.72, 147.20, zoom = 6) %>%
+  addProviderTiles("OpenStreetMap") %>%
+  addRasterImage(
+    idw_raster_slope,
+    project = TRUE,
+    group = "Minutes",
+    layerId = "Minutes",
+    colors = custom_palette,
+    opacity = 0.5
+  ) %>%
+  addPolygons(
+    data = as(st_transform(wp_combined_poly, 4326), "Spatial"),
+    stroke = FALSE,
+    smoothFactor = 0.2,
+    fillColor = 'blue',
+    fillOpacity = 0.8
+  ) %>%
+  addImageQuery(
+    idw_raster_slope,
+    project = TRUE,
+    layerId = "Minutes",
+    digits = 1,
+    prefix = "Helicopter return"
+  ) %>%
+  addLegend(
+    "bottomright",
+    values = range(values(idw_raster_slope)),
+    pal = custom_palette,
+    title = "Time in minutes",
+    opacity = 0.5
+  )
+
+map_raster_slope
+
+
+```
+
+### More sophisticated helicopter travel times
+
+-   Build lines between water points and demand points
+-   Point sample every 100m
+-   Attribute each point with linear distance from water point (x) and elevation (z)
+-   Draw a convex hull around points
+-   Convert to points (if not already)
+-   Delete any points falling where z \< a line between wp and dp (in case of -v- shape)
+-   Check ordering of points is still intact
+-   Calculate travel times between point pairs (0, 1 to n-1, n)
+-   Start helicopter speed at 0 km/h at water point with easing
+-   Slow helicopter to (?) km/h at demand point
+-   all other travel speeds proportional to slope & load
+-   Sum each path
+-   Create rasters using IDW (distance-weighted smoothing) for efficient maps
+
+\`\`\`{r Chunk 9: Better helicopter travel times, message=FALSE, warning=FALSE} knitr::opts_chunk\$set(cache = TRUE)
